@@ -1,0 +1,984 @@
+kmalloc
+
+分支1---分配数量在编译时确定，为常量，大小大于8KB
+kmalloc_large(size, flags)
+|--->get_order(size);                             先拿到size对应的order，从这里看后面要按页分配
+|--->kmalloc_order_trace(size, flags, order);     进入主流程
+|---|--->kmalloc_order(size, flags, order);       arm64上最初的slab经过slob已经升级到了slub
+|---|---|--->flags |= __GFP_COMP;                 这个标记应该是支持内存紧缩吧？
+|---|---|--->page = alloc_pages(flags, order);
+|---|---|---|--->alloc_pages_node(numa_node_id(), gfp_mask, order);  嵌入式当前均为UMA模型，一致内存访问
+|---|---|---|---|--->__alloc_pages_node(nid, gfp_mask, order);
+|---|---|---|---|---|--->__alloc_pages(gfp_mask, order, node_zonelist(nid, gfp_mask));
+|---|---|---|---|---|---|--->__alloc_pages_nodemask(gfp_mask, order, zonelist, NULL);   zone buddy 分配的核心
+|---|---|---|---|---|---|---|--->first_zones_zonelist(ac.zonelist,ac.high_zoneidx, ac.nodemask)
+|---|---|---|---|---|---|---|--->get_page_from_freelist(alloc_mask, order, alloc_flags, &ac);   快速分配
+|---|---|---|---|---|---|---|---|--->buffered_rmqueue(ac->preferred_zoneref->zone, zone, order,gfp_mask, alloc_flags, ac->migratetype)
+|---|---|---|---|---|---|---|--->__alloc_pages_slowpath(alloc_mask, order, &ac);                慢速分配
+
+上面仅是大体流程，__alloc_pages_nodemask为伙伴系统分配的核心，重点看下
+struct page *__alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order,
+			struct zonelist *zonelist, nodemask_t *nodemask)
+{
+	struct page *page;        							待返回的页指针
+	unsigned int alloc_flags = ALLOC_WMARK_LOW;         低等级水线       
+	gfp_t alloc_mask = gfp_mask; 						/* The gfp_t that was actually used for allocation */
+	struct alloc_context ac = {							ac实体填充			
+		.high_zoneidx = gfp_zone(gfp_mask),				支持的最大ZONE id，arm64上为1，ZONE_DMA和ZONE_NORMAL
+		.zonelist = zonelist,                           这是一个核心，zonelist，详见附录，需要重点研究下
+		.nodemask = nodemask,                           为NULL，不理会
+		.migratetype = gfpflags_to_migratetype(gfp_mask), 页迁移类型，这里涉及的东西多一点，页的属性有很多，可读、可写、可读写、可回收、可迁移、不可迁移等等，详见附录
+	};
+
+	if (cpusets_enabled())  /*永远false*/
+    {
+		alloc_mask |= __GFP_HARDWALL;
+		alloc_flags |= ALLOC_CPUSET;                  这个标识比较有意思，
+		if (!ac.nodemask)
+			ac.nodemask = &cpuset_current_mems_allowed;           #define cpuset_current_mems_allowed (node_states[N_MEMORY])
+	}
+
+    
+	gfp_mask &= gfp_allowed_mask;                      这个标识比较有意思，
+
+	lockdep_trace_alloc(gfp_mask);
+
+	might_sleep_if(gfp_mask & __GFP_DIRECT_RECLAIM); /*只要有此bit组成的，都可能会睡眠，所以啊在中断处理函数中不能用GFP_KERNEL一些flag*/
+
+	if (should_fail_alloc_page(gfp_mask, order))   /*永远false*/
+		return NULL;
+
+	/* 几个zones，具体都有哪些？
+	 * Check the zones suitable for the gfp_mask contain at least one
+	 * valid zone. It's possible to have an empty zonelist as a result
+	 * of __GFP_THISNODE and a memoryless node
+	 */
+	if (unlikely(!zonelist->_zonerefs->zone))
+		return NULL;
+
+	if (IS_ENABLED(CONFIG_CMA) && ac.migratetype == MIGRATE_MOVABLE) /*CMA有定义，主要看迁移类型*/
+		alloc_flags |= ALLOC_CMA;									 是否有走进来呢？
+
+	/* Dirty zone balancing only done in the fast path */
+	ac.spread_dirty_pages = (gfp_mask & __GFP_WRITE);
+
+#if 0
+    printk("ac.high_zoneidx [%d]\n", ac.high_zoneidx); /*最高还是看枚举定义，为1，NORMAL_ZONE*/
+    printk("ac.nodemask addr [%p]\n", ac.nodemask);
+    printk("ac.migratetype  [%d]\n", ac.migratetype);
+#endif
+	/*
+	 * The preferred zone is used for statistics but crucially it is
+	 * also used as the starting point for the zonelist iterator. It
+	 * may get reset for allocations that ignore memory policies.
+	 */
+	ac.preferred_zoneref = first_zones_zonelist(ac.zonelist,
+					ac.high_zoneidx, ac.nodemask);             先从zonelist中看下有没有可用的zone
+	if (!ac.preferred_zoneref->zone) {
+		page = NULL;
+		/*
+		 * This might be due to race with cpuset_current_mems_allowed
+		 * update, so make sure we retry with original nodemask in the
+		 * slow path.
+		 */
+		goto no_zone;                                   /*没有则直接去慢速分配*/
+	}
+
+    //printk("Found the zone the name is [%s]\n", ac.preferred_zoneref->zone->name); /*明显的是DMA*/
+    
+	/* First allocation attempt */
+	page = get_page_from_freelist(alloc_mask, order, alloc_flags, &ac);     快速分配
+	if (likely(page))
+		goto out;
+
+no_zone:
+	/*
+	 * Runtime PM, block IO and its error handling path can deadlock
+	 * because I/O on the device might not complete.
+	 */
+	alloc_mask = memalloc_noio_flags(gfp_mask);
+	ac.spread_dirty_pages = false;
+
+	/*
+	 * Restore the original nodemask if it was potentially replaced with
+	 * &cpuset_current_mems_allowed to optimize the fast-path attempt.
+	 */
+	if (unlikely(ac.nodemask != nodemask))
+		ac.nodemask = nodemask;
+
+	page = __alloc_pages_slowpath(alloc_mask, order, &ac);          /*慢速分配*/
+
+out:
+	if (memcg_kmem_enabled() && (gfp_mask & __GFP_ACCOUNT) && page &&
+	    unlikely(memcg_kmem_charge(page, gfp_mask, order) != 0))       最后返回前的校验，也很重要
+	{
+		__free_pages(page, order);
+		page = NULL;
+	}
+
+	if (kmemcheck_enabled && page)
+		kmemcheck_pagealloc_alloc(page, order, gfp_mask);
+
+	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype);
+
+	return page;
+}
+/*Returns the first zone at or below highest_zoneidx within the allowed nodemask in a zonelist*/
+|---|---|---|---|---|---|---|---|--->first_zones_zonelist(ac.zonelist,ac.high_zoneidx, ac.nodemask)
+|---|---|---|---|---|---|---|---|---> get_page_from_freelist(alloc_mask, order, alloc_flags, &ac)
+
+static struct page * get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+						const struct alloc_context *ac)
+{
+	struct zoneref *z = ac->preferred_zoneref;                 		ZONE_DMA
+	struct zone *zone;
+	struct pglist_data *last_pgdat_dirty_limit = NULL;  			/*pglist_data 好像是一个node一个的*/
+
+	/*
+	 * Scan zonelist, looking for a zone with enough free.             扫描zonelist链表，找一个有足够空闲内存的zone使用，若是OS内存超出3GB有了NORMAL，则可能是DMA没有就去NORMAL中找空闲内存了
+	 * See also __cpuset_node_allowed() comment in kernel/cpuset.c.
+	 */
+	for_next_zone_zonelist_nodemask(zone, z, ac->zonelist, ac->high_zoneidx,
+								ac->nodemask) {
+		struct page *page;
+		unsigned long mark;
+
+		if (cpusets_enabled() &&
+			(alloc_flags & ALLOC_CPUSET) &&
+			!__cpuset_zone_allowed(zone, gfp_mask))
+				continue;
+		/*
+		 * When allocating a page cache page for writing, we
+		 * want to get it from a node that is within its dirty
+		 * limit, such that no single node holds more than its
+		 * proportional share of globally allowed dirty pages.
+		 * The dirty limits take into account the node's
+		 * lowmem reserves and high watermark so that kswapd
+		 * should be able to balance it without having to
+		 * write pages from its LRU list.
+		 * 这点很重要，当前还未理解2021-10-22-继续看下去
+		 * XXX: For now, allow allocations to potentially
+		 * exceed the per-node dirty limit in the slowpath
+		 * (spread_dirty_pages unset) before going into reclaim,
+		 * which is important when on a NUMA setup the allowed
+		 * nodes are together not big enough to reach the
+		 * global limit.  The proper fix for these situations
+		 * will require awareness of nodes in the
+		 * dirty-throttling and the flusher threads.
+		 */
+		if (ac->spread_dirty_pages) {
+			if (last_pgdat_dirty_limit == zone->zone_pgdat)
+				continue;
+
+			if (!node_dirty_ok(zone->zone_pgdat)) {
+				last_pgdat_dirty_limit = zone->zone_pgdat;
+				continue;
+			}
+		}
+
+		mark = zone->watermark[alloc_flags & ALLOC_WMARK_MASK];
+		if (!zone_watermark_fast(zone, order, mark,
+				       ac_classzone_idx(ac), alloc_flags)) {
+			int ret;
+
+			/* Checked here to keep the fast path fast */
+			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);
+			if (alloc_flags & ALLOC_NO_WATERMARKS)
+				goto try_this_zone;
+
+			if (node_reclaim_mode == 0 ||
+			    !zone_allows_reclaim(ac->preferred_zoneref->zone, zone))
+				continue;
+
+			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order); /*这里就有回收处理了*/
+			switch (ret) {
+			case NODE_RECLAIM_NOSCAN:
+				/* did not scan */
+				continue;
+			case NODE_RECLAIM_FULL:
+				/* scanned but unreclaimable */
+				continue;
+			default:
+				/* did we reclaim enough */
+				if (zone_watermark_ok(zone, order, mark,
+						ac_classzone_idx(ac), alloc_flags))
+					goto try_this_zone;
+
+				continue;
+			}
+		}
+
+try_this_zone:
+		page = buffered_rmqueue(ac->preferred_zoneref->zone, zone, order,
+				gfp_mask, alloc_flags, ac->migratetype);
+		if (page) {
+			prep_new_page(page, order, gfp_mask, alloc_flags);
+
+			/*
+			 * If this is a high-order atomic allocation then check
+			 * if the pageblock should be reserved for the future
+			 */
+			if (unlikely(order && (alloc_flags & ALLOC_HARDER)))
+				reserve_highatomic_pageblock(page, zone, order);
+
+			return page;
+		}
+	}
+
+	return NULL;
+}
+
+|---|---|---|---|---|---|---|---|---|---> zone_watermark_fast(zone, order, mark,ac_classzone_idx(ac), alloc_flags)
+
+static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
+		unsigned long mark, int classzone_idx, unsigned int alloc_flags)
+{
+	long free_pages = zone_page_state(z, NR_FREE_PAGES);  /*这里指向了zone->vm_stat,哪里来的呢，里面是什么呢？*/
+	long cma_pages = 0;
+
+#ifdef CONFIG_CMA
+	/* If allocation can't use CMA areas don't use free CMA pages */
+	if (!(alloc_flags & ALLOC_CMA))
+		cma_pages = zone_page_state(z, NR_FREE_CMA_PAGES);
+#endif
+
+    printk("zone_watermark_fast free_pages %d cma_pages %d\n", free_pages, cma_pages);
+
+	/*
+	 * Fast check for order-0 only. If this fails then the reserves
+	 * need to be calculated. There is a corner case where the check
+	 * passes but only the high-order atomic reserve are free. If
+	 * the caller is !atomic then it'll uselessly search the free
+	 * list. That corner case is then slower but it is harmless.
+	 */
+	if (!order && (free_pages - cma_pages) > mark + z->lowmem_reserve[classzone_idx])
+		return true;
+
+	return __zone_watermark_ok(z, order, mark, classzone_idx, alloc_flags,
+					free_pages);
+}
+|---|---|---|---|---|---|---|---|---|---|--->__zone_watermark_ok
+bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+			 int classzone_idx, unsigned int alloc_flags,
+			 long free_pages)
+{
+	long min = mark;
+	int o;
+	const bool alloc_harder = (alloc_flags & ALLOC_HARDER);
+
+	/* free_pages may go negative - that's OK */
+	free_pages -= (1 << order) - 1;
+
+	if (alloc_flags & ALLOC_HIGH)
+		min -= min / 2;
+
+	/*
+	 * If the caller does not have rights to ALLOC_HARDER then subtract
+	 * the high-atomic reserves. This will over-estimate the size of the
+	 * atomic reserve but it avoids a search.
+	 */
+	if (likely(!alloc_harder))
+		free_pages -= z->nr_reserved_highatomic;
+	else
+		min -= min / 4;
+
+#ifdef CONFIG_CMA
+	/* If allocation can't use CMA areas don't use free CMA pages */
+	if (!(alloc_flags & ALLOC_CMA))
+		free_pages -= zone_page_state(z, NR_FREE_CMA_PAGES);
+#endif
+
+	/*
+	 * Check watermarks for an order-0 allocation request. If these
+	 * are not met, then a high-order request also cannot go ahead
+	 * even if a suitable page happened to be free.
+	 */
+	if (free_pages <= min + z->lowmem_reserve[classzone_idx])
+		return false;
+
+	/* If this is an order-0 request then the watermark is fine */
+	if (!order)
+		return true;
+
+	/* For a high-order request, check at least one suitable page is free */
+	for (o = order; o < MAX_ORDER; o++) {
+		struct free_area *area = &z->free_area[o];
+		int mt;
+
+		if (!area->nr_free)
+			continue;
+
+		if (alloc_harder)
+			return true;
+
+		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
+			if (!list_empty(&area->free_list[mt]))
+				return true;
+		}
+
+#ifdef CONFIG_CMA
+		if ((alloc_flags & ALLOC_CMA) &&
+		    !list_empty(&area->free_list[MIGRATE_CMA])) {
+			return true;
+		}
+#endif
+	}
+	return false;
+}
+
+
+|---|---|---|---|---|---|---|---|---|---|--->buffered_rmqueue
+/*
+ * Allocate a page from the given zone. Use pcplists for order-0 allocations.
+ */
+static inline
+struct page *buffered_rmqueue(struct zone *preferred_zone,
+			struct zone *zone, unsigned int order,
+			gfp_t gfp_flags, unsigned int alloc_flags,
+			int migratetype)
+{
+	unsigned long flags;
+	struct page *page;
+	bool cold = ((gfp_flags & __GFP_COLD) != 0);
+
+	if (likely(order == 0)) {             order 为0是一个页，首先kmalloc进入这里的条件是大于8kb，在kmalloc中不会执行此处
+		struct per_cpu_pages *pcp;
+		struct list_head *list;
+
+		local_irq_save(flags);
+		do {
+			pcp = &this_cpu_ptr(zone->pageset)->pcp;
+			list = &pcp->lists[migratetype];
+			if (list_empty(list)) {
+				pcp->count += rmqueue_bulk(zone, 0,
+						pcp->batch, list,
+						migratetype, cold);
+				if (unlikely(list_empty(list)))
+					goto failed;
+			}
+
+			if (cold)
+				page = list_last_entry(list, struct page, lru);
+			else
+				page = list_first_entry(list, struct page, lru);
+
+			list_del(&page->lru);
+			pcp->count--;
+
+		} while (check_new_pcp(page));
+	} else {
+		/*
+		 * We most definitely don't want callers attempting to
+		 * allocate greater than order-1 page units with __GFP_NOFAIL.
+		 */
+		WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1));
+		spin_lock_irqsave(&zone->lock, flags);
+
+		do {
+			page = NULL;
+			if (alloc_flags & ALLOC_HARDER) {
+				page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+				if (page)
+					trace_mm_page_alloc_zone_locked(page, order, migratetype);
+			}
+			if (!page)
+				page = __rmqueue(zone, order, migratetype);
+		} while (page && check_new_pages(page, order));
+		spin_unlock(&zone->lock);
+		if (!page)
+			goto failed;
+		__mod_zone_freepage_state(zone, -(1 << order),
+					  get_pcppage_migratetype(page));
+	}
+
+	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
+	zone_statistics(preferred_zone, zone, gfp_flags);
+	local_irq_restore(flags);
+
+	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+	return page;
+
+failed:
+	local_irq_restore(flags);
+	return NULL;
+}
+
+
+
+
+|---|---|--->ret = page ? page_address(page) : NULL;
+
+分支2---分配数量在编译时确定，为常量，大小小于等于8KB
+|--->int index = kmalloc_index(size);   这里面比较奇怪，上面的if条件就是以8KB位界限的，这里面最大到64MB，可能还有其他地方用到这个接口吧
+|--->kmem_cache_alloc_trace(kmalloc_caches[index],flags, size)
+|---|--->kmem_cache_alloc(s, flags);
+|---|---|--->slab_alloc(s, gfpflags, _RET_IP_);
+|---|---|---|--->slab_alloc_node(s, gfpflags, NUMA_NO_NODE, addr);
+|---|---|---|---|--->slab_pre_alloc_hook(s, gfpflags);
+|---|---|---|---|--->object = __slab_alloc(s, gfpflags, node, addr, c);
+|---|---|---|---|---|--->___slab_alloc(s, gfpflags, node, addr, c);   慢速分配
+|---|---|---|---|---|---|--->freelist = get_freelist(s, page);
+|---|---|---|---|---|---|--->freelist = new_slab_objects(s, gfpflags, node, &c);
+|---|---|---|---|---|---|---|--->freelist = get_partial(s, flags, node, c);
+|---|---|---|---|---|---|---|---|--->object = get_partial_node(s, get_node(s, searchnode), c, flags);
+|---|---|---|---|---|---|---|---|---|--->t = acquire_slab(s, n, page, object == NULL, &objects);
+|---|---|---|---|---|---|---|---|---|---|--->remove_partial(n, page);
+|---|---|---|---|---|---|---|---|--->get_any_partial(s, flags, c); 在UMA模型中返回NULL
+|---|---|---|---|---|---|---|--->page = new_slab(s, flags, node);
+|---|---|---|---|---|---|---|---|--->allocate_slab(s,flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
+|---|---|---|---|---|---|---|---|---|--->page = alloc_slab_page(s, alloc_gfp, node, oo);
+|---|---|---|---|---|---|---|---|---|---|--->page = alloc_pages(flags, order);    if (node == NUMA_NO_NODE)
+|---|---|---|---|---|---|---|---|---|---|---|--->alloc_pages_node(numa_node_id(), gfp_mask, order) 在分支1中有分析
+|---|---|---|---|---|---|---|---|---|---|--->page = __alloc_pages_node(node, flags, order);
+|---|---|---|---|---|---|---|---|---|--->page->objects = oo_objects(oo);	page->inuse = page->objects; page->frozen = 1;
+|---|---|---|---|---|---|---|--->freelist = page->freelist;
+|---|---|---|---|---|---|---|--->c->page = page;
+|---|---|---|---|--->*next_object = get_freepointer_safe(s, object);
+|---|---|---|---|--->memset(object, 0, s->object_size);
+
+
+分支3  ---size编译时为非常量
+|--->__kmalloc(size, flags)
+|---|--->kmalloc_large(size, flags);
+|---|--->s = kmalloc_slab(size, flags);    
+|---|---|--->kmalloc_caches[index];
+|---|--->ret = slab_alloc(s, flags, _RET_IP_);
+
+
+
+
+附录3
+struct zone {
+	/* Read-mostly fields */
+
+	/* zone watermarks, access with *_wmark_pages(zone) macros */
+	unsigned long watermark[NR_WMARK];
+	/*
+		enum zone_watermarks {
+			WMARK_MIN,
+			WMARK_LOW,
+			WMARK_HIGH,
+			NR_WMARK
+		};
+	*/
+
+	unsigned long nr_reserved_highatomic;
+
+	/*
+	 * We don't know if the memory that we're going to allocate will be
+	 * freeable or/and it will be released eventually, so to avoid totally
+	 * wasting several GB of ram we must reserve some of the lower zone
+	 * memory (otherwise we risk to run OOM on the lower zones despite
+	 * there being tons of freeable ram on the higher zones).  This array is
+	 * recalculated at runtime if the sysctl_lowmem_reserve_ratio sysctl
+	 * changes.
+	 */
+	long lowmem_reserve[MAX_NR_ZONES];       从字面意思看是预留的一部分内存
+
+#ifdef CONFIG_NUMA
+	int node;
+#endif
+	struct pglist_data	*zone_pgdat;              这是一个关键点，见附录4
+	struct per_cpu_pageset __percpu *pageset;     这个也是关键点，见附录4
+
+#ifndef CONFIG_SPARSEMEM
+	/*
+	 * Flags for a pageblock_nr_pages block. See pageblock-flags.h.
+	 * In SPARSEMEM, this map is stored in struct mem_section
+	 */
+	unsigned long		*pageblock_flags;
+#endif /* CONFIG_SPARSEMEM */
+
+	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
+	unsigned long		zone_start_pfn;
+
+	/*
+	 * spanned_pages is the total pages spanned by the zone, including
+	 * holes, which is calculated as:
+	 * 	spanned_pages = zone_end_pfn - zone_start_pfn;
+	 *
+	 * present_pages is physical pages existing within the zone, which
+	 * is calculated as:
+	 *	present_pages = spanned_pages - absent_pages(pages in holes);
+	 *
+	 * managed_pages is present pages managed by the buddy system, which
+	 * is calculated as (reserved_pages includes pages allocated by the
+	 * bootmem allocator):
+	 *	managed_pages = present_pages - reserved_pages;
+	 *
+	 * So present_pages may be used by memory hotplug or memory power
+	 * management logic to figure out unmanaged pages by checking
+	 * (present_pages - managed_pages). And managed_pages should be used
+	 * by page allocator and vm scanner to calculate all kinds of watermarks
+	 * and thresholds.
+	 *
+	 * Locking rules:
+	 *
+	 * zone_start_pfn and spanned_pages are protected by span_seqlock.
+	 * It is a seqlock because it has to be read outside of zone->lock,
+	 * and it is done in the main allocator path.  But, it is written
+	 * quite infrequently.
+	 *
+	 * The span_seq lock is declared along with zone->lock because it is
+	 * frequently read in proximity to zone->lock.  It's good to
+	 * give them a chance of being in the same cacheline.
+	 *
+	 * Write access to present_pages at runtime should be protected by
+	 * mem_hotplug_begin/end(). Any reader who can't tolerant drift of
+	 * present_pages should get_online_mems() to get a stable value.
+	 *
+	 * Read access to managed_pages should be safe because it's unsigned
+	 * long. Write access to zone->managed_pages and totalram_pages are
+	 * protected by managed_page_count_lock at runtime. Idealy only
+	 * adjust_managed_page_count() should be used instead of directly
+	 * touching zone->managed_pages and totalram_pages.
+	 */
+	unsigned long		managed_pages;
+	unsigned long		spanned_pages;
+	unsigned long		present_pages;
+
+	const char		*name;
+
+#ifdef CONFIG_MEMORY_ISOLATION
+	/*
+	 * Number of isolated pageblock. It is used to solve incorrect
+	 * freepage counting problem due to racy retrieving migratetype
+	 * of pageblock. Protected by zone->lock.
+	 */
+	unsigned long		nr_isolate_pageblock;
+#endif
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+	/* see spanned/present_pages for more description */
+	seqlock_t		span_seqlock;
+#endif
+
+	int initialized;
+
+	/* Write-intensive fields used from the page allocator */
+	ZONE_PADDING(_pad1_)
+
+	/* free areas of different sizes */
+	struct free_area	free_area[MAX_ORDER];
+
+	/* zone flags, see below */
+	unsigned long		flags;
+
+	/* Primarily protects free_area */
+	spinlock_t		lock;
+
+	/* Write-intensive fields used by compaction and vmstats. */
+	ZONE_PADDING(_pad2_)
+
+	/*
+	 * When free pages are below this point, additional steps are taken
+	 * when reading the number of free pages to avoid per-cpu counter
+	 * drift allowing watermarks to be breached
+	 */
+	unsigned long percpu_drift_mark;
+
+#if defined CONFIG_COMPACTION || defined CONFIG_CMA
+	/* pfn where compaction free scanner should start */
+	unsigned long		compact_cached_free_pfn;
+	/* pfn where async and sync compaction migration scanner should start */
+	unsigned long		compact_cached_migrate_pfn[2];
+#endif
+
+#ifdef CONFIG_COMPACTION
+	/*
+	 * On compaction failure, 1<<compact_defer_shift compactions
+	 * are skipped before trying again. The number attempted since
+	 * last failure is tracked with compact_considered.
+	 */
+	unsigned int		compact_considered;
+	unsigned int		compact_defer_shift;
+	int			compact_order_failed;
+#endif
+
+#if defined CONFIG_COMPACTION || defined CONFIG_CMA
+	/* Set to true when the PG_migrate_skip bits should be cleared */
+	bool			compact_blockskip_flush;
+#endif
+
+	bool			contiguous;
+
+	ZONE_PADDING(_pad3_)
+	/* Zone statistics */
+	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
+} ____cacheline_internodealigned_in_smp;
+
+
+附录4
+typedef struct pglist_data{
+
+	struct zone node_zones[MAX_NR_ZONES];
+	struct zonelist node_zonelists[MAX_ZONELISTS];   见附录6
+	int nr_zones;
+#ifdef CONFIG_FLAT_NODE_MEM_MAP	/* means !SPARSEMEM */
+	struct page *node_mem_map;
+#ifdef CONFIG_PAGE_EXTENSION
+	struct page_ext *node_page_ext;
+#endif
+#endif
+#ifndef CONFIG_NO_BOOTMEM
+	struct bootmem_data *bdata;
+#endif
+#ifdef CONFIG_MEMORY_HOTPLUG
+	/*
+	 * Must be held any time you expect node_start_pfn, node_present_pages
+	 * or node_spanned_pages stay constant.  Holding this will also
+	 * guarantee that any pfn_valid() stays that way.
+	 *
+	 * pgdat_resize_lock() and pgdat_resize_unlock() are provided to
+	 * manipulate node_size_lock without checking for CONFIG_MEMORY_HOTPLUG.
+	 *
+	 * Nests above zone->lock and zone->span_seqlock
+	 */
+	spinlock_t node_size_lock;
+#endif
+	unsigned long node_start_pfn;
+	unsigned long node_present_pages; /* total number of physical pages */
+	unsigned long node_spanned_pages; /* total size of physical page
+					     range, including holes */
+	int node_id;
+	wait_queue_head_t kswapd_wait;
+	wait_queue_head_t pfmemalloc_wait;
+	struct task_struct *kswapd;	/* Protected by
+					   mem_hotplug_begin/end() */
+	int kswapd_order;
+	enum zone_type kswapd_classzone_idx;
+
+#ifdef CONFIG_COMPACTION
+	int kcompactd_max_order;
+	enum zone_type kcompactd_classzone_idx;
+	wait_queue_head_t kcompactd_wait;
+	struct task_struct *kcompactd;
+#endif
+#ifdef CONFIG_NUMA_BALANCING
+	/* Lock serializing the migrate rate limiting window */
+	spinlock_t numabalancing_migrate_lock;
+
+	/* Rate limiting time interval */
+	unsigned long numabalancing_migrate_next_window;
+
+	/* Number of pages migrated during the rate limiting time interval */
+	unsigned long numabalancing_migrate_nr_pages;
+#endif
+	/*
+	 * This is a per-node reserve of pages that are not available
+	 * to userspace allocations.
+	 */
+	unsigned long		totalreserve_pages;
+
+#ifdef CONFIG_NUMA
+	/*
+	 * zone reclaim becomes active if more unmapped pages exist.
+	 */
+	unsigned long		min_unmapped_pages;
+	unsigned long		min_slab_pages;
+#endif /* CONFIG_NUMA */
+
+	/* Write-intensive fields used by page reclaim */
+	ZONE_PADDING(_pad1_)
+	spinlock_t		lru_lock;
+
+#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+	/*
+	 * If memory initialisation on large machines is deferred then this
+	 * is the first PFN that needs to be initialised.
+	 */
+	unsigned long first_deferred_pfn;
+	unsigned long static_init_size;
+#endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	spinlock_t split_queue_lock;
+	struct list_head split_queue;
+	unsigned long split_queue_len;
+#endif
+
+	/* Fields commonly accessed by the page reclaim scanner */
+	struct lruvec		lruvec;
+
+	/*
+	 * The target ratio of ACTIVE_ANON to INACTIVE_ANON pages on
+	 * this node's LRU.  Maintained by the pageout code.
+	 */
+	unsigned int inactive_ratio;
+
+	unsigned long		flags;
+
+	ZONE_PADDING(_pad2_)
+
+	/* Per-node vmstats */
+	struct per_cpu_nodestat __percpu *per_cpu_nodestats;
+	atomic_long_t		vm_stat[NR_VM_NODE_STAT_ITEMS];
+}pg_data_t;
+
+
+附录6
+/*
+ * One allocation request operates on a zonelist. A zonelist
+ * is a list of zones, the first one is the 'goal' of the
+ * allocation, the other zones are fallback zones, in decreasing
+ * priority.
+ *
+ * To speed the reading of the zonelist, the zonerefs contain the zone index
+ * of the entry being read. Helper functions to access information given
+ * a struct zoneref are
+ *
+ * zonelist_zone()	- Return the struct zone * for an entry in _zonerefs
+ * zonelist_zone_idx()	- Return the index of the zone for an entry
+ * zonelist_node_idx()	- Return the index of the node for an entry
+ */
+struct zonelist {
+	struct zoneref _zonerefs[MAX_ZONES_PER_ZONELIST + 1];
+};
+
+/*
+ * This struct contains information about a zone in a zonelist. It is stored
+ * here to avoid dereferences into large structures and lookups of tables
+ */
+struct zoneref {
+	struct zone *zone;	/* Pointer to actual zone */
+	int zone_idx;		/* zone_idx(zoneref->zone) */
+};
+
+
+附录7
+static inline
+struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
+						int migratetype)
+{
+	unsigned int current_order;
+	struct free_area *area;
+	struct page *page;
+
+	/* Find a page of the appropriate size in the preferred list */
+	for (current_order = order; current_order < MAX_ORDER; ++current_order) {
+		area = &(zone->free_area[current_order]);
+		page = list_first_entry_or_null(&area->free_list[migratetype],
+							struct page, lru);
+		if (!page)
+			continue;
+		list_del(&page->lru);
+		rmv_page_order(page);
+		area->nr_free--;
+		expand(zone, page, order, current_order, area, migratetype);
+		set_pcppage_migratetype(page, migratetype);
+		return page;
+	}
+
+	return NULL;
+}
+
+以请求的order为基础，在不满足时向上请求；
+
+
+
+附录8
+/*
+ * Each physical page in the system has a struct page associated with
+ * it to keep track of whatever it is we are using the page for at the
+ * moment. Note that we have no way to track which tasks are using
+ * a page, though if it is a pagecache page, rmap structures can tell us
+ * who is mapping it.
+ *
+ * The objects in struct page are organized in double word blocks in
+ * order to allows us to use atomic double word operations on portions
+ * of struct page. That is currently only used by slub but the arrangement
+ * allows the use of atomic double word operations on the flags/mapping
+ * and lru list pointers also.
+ */
+struct page {
+	/* First double word block */
+	unsigned long flags;		/* Atomic flags, some possibly
+					 * updated asynchronously */
+	union {
+		struct address_space *mapping;	/* If low bit clear, points to
+						 * inode address_space, or NULL.
+						 * If page mapped as anonymous
+						 * memory, low bit is set, and
+						 * it points to anon_vma object:
+						 * see PAGE_MAPPING_ANON below.
+						 */
+		void *s_mem;			/* slab first object */
+		atomic_t compound_mapcount;	/* first tail page */
+		/* page_deferred_list().next	 -- second tail page */
+	};
+
+	/* Second double word */
+	union {
+		pgoff_t index;		/* Our offset within mapping. */
+		void *freelist;		/* sl[aou]b first free object */
+		/* page_deferred_list().prev	-- second tail page */
+	};
+
+	union {
+#if defined(CONFIG_HAVE_CMPXCHG_DOUBLE) && \
+	defined(CONFIG_HAVE_ALIGNED_STRUCT_PAGE)
+		/* Used for cmpxchg_double in slub */
+		unsigned long counters;
+#else
+		/*
+		 * Keep _refcount separate from slub cmpxchg_double data.
+		 * As the rest of the double word is protected by slab_lock
+		 * but _refcount is not.
+		 */
+		unsigned counters;
+#endif
+		struct {
+
+			union {
+				/*
+				 * Count of ptes mapped in mms, to show when
+				 * page is mapped & limit reverse map searches.
+				 *
+				 * Extra information about page type may be
+				 * stored here for pages that are never mapped,
+				 * in which case the value MUST BE <= -2.
+				 * See page-flags.h for more details.
+				 */
+				atomic_t _mapcount;
+
+				unsigned int active;		/* SLAB */
+				struct {			/* SLUB */
+					unsigned inuse:16;
+					unsigned objects:15;
+					unsigned frozen:1;
+				};
+				int units;			/* SLOB */
+			};
+			/*
+			 * Usage count, *USE WRAPPER FUNCTION* when manual
+			 * accounting. See page_ref.h
+			 */
+			atomic_t _refcount;
+		};
+	};
+
+	/*
+	 * Third double word block
+	 *
+	 * WARNING: bit 0 of the first word encode PageTail(). That means
+	 * the rest users of the storage space MUST NOT use the bit to
+	 * avoid collision and false-positive PageTail().
+	 */
+	union {
+		struct list_head lru;	/* Pageout list, eg. active_list
+					 * protected by zone_lru_lock !
+					 * Can be used as a generic list
+					 * by the page owner.
+					 */
+		struct dev_pagemap *pgmap; /* ZONE_DEVICE pages are never on an
+					    * lru or handled by a slab
+					    * allocator, this points to the
+					    * hosting device page map.
+					    */
+		struct {		/* slub per cpu partial pages */
+			struct page *next;	/* Next partial slab */
+#ifdef CONFIG_64BIT
+			int pages;	/* Nr of partial slabs left */
+			int pobjects;	/* Approximate # of objects */
+#else
+			short int pages;
+			short int pobjects;
+#endif
+		};
+
+		struct rcu_head rcu_head;	/* Used by SLAB
+						 * when destroying via RCU
+						 */
+		/* Tail pages of compound page */
+		struct {
+			unsigned long compound_head; /* If bit zero is set */
+
+			/* First tail page only */
+#ifdef CONFIG_64BIT
+			/*
+			 * On 64 bit system we have enough space in struct page
+			 * to encode compound_dtor and compound_order with
+			 * unsigned int. It can help compiler generate better or
+			 * smaller code on some archtectures.
+			 */
+			unsigned int compound_dtor;
+			unsigned int compound_order;
+#else
+			unsigned short int compound_dtor;
+			unsigned short int compound_order;
+#endif
+		};
+
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && USE_SPLIT_PMD_PTLOCKS
+		struct {
+			unsigned long __pad;	/* do not overlay pmd_huge_pte
+						 * with compound_head to avoid
+						 * possible bit 0 collision.
+						 */
+			pgtable_t pmd_huge_pte; /* protected by page->ptl */
+		};
+#endif
+	};
+
+	/* Remainder is not double word aligned */
+	union {
+		unsigned long private;		/* Mapping-private opaque data:
+					 	 * usually used for buffer_heads
+						 * if PagePrivate set; used for
+						 * swp_entry_t if PageSwapCache;
+						 * indicates order in the buddy
+						 * system if PG_buddy is set.
+						 */
+#if USE_SPLIT_PTE_PTLOCKS
+#if ALLOC_SPLIT_PTLOCKS
+		spinlock_t *ptl;
+#else
+		spinlock_t ptl;
+#endif
+#endif
+		struct kmem_cache *slab_cache;	/* SL[AU]B: Pointer to slab */
+	};
+
+#ifdef CONFIG_MEMCG
+	struct mem_cgroup *mem_cgroup;
+#endif
+
+	/*
+	 * On machines where all RAM is mapped into kernel address space,
+	 * we can simply calculate the virtual address. On machines with
+	 * highmem some memory is mapped into kernel virtual memory
+	 * dynamically, so we need a place to store that address.
+	 * Note that this field could be 16 bits on x86 ... ;)
+	 *
+	 * Architectures with slow multiplication can define
+	 * WANT_PAGE_VIRTUAL in asm/page.h
+	 */
+#if defined(WANT_PAGE_VIRTUAL)
+	void *virtual;			/* Kernel virtual address (NULL if
+					   not kmapped, ie. highmem) */
+#endif /* WANT_PAGE_VIRTUAL */
+
+#ifdef CONFIG_KMEMCHECK
+	/*
+	 * kmemcheck wants to track the status of each byte in a page; this
+	 * is a pointer to such a status block. NULL if not tracked.
+	 */
+	void *shadow;
+#endif
+
+#ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+	int _last_cpupid;
+#endif
+}
+
+
+附录9
+kmalloc_caches 的来源
+start_kernel
+--->mm_init
+---|--->kmem_cache_init  /* Now we can use the kmem_cache to allocate kmalloc slabs */
+---|---|--->create_kmalloc_caches(0);
+---|---|---|--->void __init create_kmalloc_caches(unsigned long flags)
+---|---|---|---|--->new_kmalloc_cache
+---|---|---|---|---|--->kmalloc_caches[idx] = create_kmalloc_cache(kmalloc_info[idx].name,
+					kmalloc_info[idx].size, flags);
